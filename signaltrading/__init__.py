@@ -1,0 +1,1 @@
+"""Research-only market monitoring. No authenticated trading capabilities."""
