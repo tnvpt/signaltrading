@@ -52,6 +52,31 @@ Ctrl+C để dừng. `--threshold-pct 2` là ngưỡng biến động tuyệt đ
 cửa sổ 30/60/180 giây. Đây là baseline cố định, **chưa phải đo bất thường theo
 lịch sử coin**, chưa có chuẩn hóa volume, trend filter hay tín hiệu vào lệnh.
 
+### Review RSI alerts with TradingAgents (optional)
+
+Install the TradingAgents CLI separately in Ubuntu and connect your ChatGPT
+account with `~/.local/bin/tradingagents login chatgpt`. Reviews use GPT-6 Luna
+at low reasoning with a short response. To review the most recent matching
+alert in a single day's log:
+
+```bash
+.venv/bin/python -m signaltrading.review_signal --input data/candle-watch/2026-11-26.jsonl --symbol BUSDT
+```
+
+The default prints the case locally. Add `--run` to send the historical case to
+GPT-6 Luna through the connected ChatGPT account. It gets only closed candles
+available at the decision time, plus relative volume, range expansion, where
+the signal closed within its candle, and the prior 20-candle range.
+
+```bash
+.venv/bin/python -m signaltrading.review_signal --input data/candle-watch/2026-11-26.jsonl --symbol BUSDT --replay 6
+```
+
+Replay locally checks when the first recorded close broke the signal candle's
+range. It stops at the first missing candle and reports incomplete coverage.
+Replay does not send future candles to the model. Use the thresholds as
+hypotheses and evaluate over many alerts before changing Telegram entry rules.
+
 ## Dữ liệu và chất lượng
 
 - Public combined market stream: `wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade`.
