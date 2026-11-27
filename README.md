@@ -13,6 +13,24 @@ Từ thư mục gốc project sau khi cài đặt:
 ```bash
 .venv/bin/python -m signaltrading.watch --symbols BTCUSDT ETHUSDT --duration 120
 ```
+Khi bỏ `--symbols`, watcher tự chọn tối đa 8 altcoin Binance USDT perpetual
+đang giao dịch, có đủ tuổi niêm yết để warmup và khối lượng 24h từ 1 đến 50
+triệu USDT. Watcher xếp hạng theo độ lớn biến động giá 24h ở cả hai chiều,
+chọn lại khi kết nối lại và ghi danh sách vào log. Có thể chỉnh bộ lọc:
+
+```bash
+.venv/bin/python -m signaltrading.watch --top-altcoins 8 --min-quote-volume 1000000 --max-quote-volume 50000000 --duration 0
+```
+
+Autostart uses `--rotate-futures`. This mode includes BTC/ETH and cycles through
+active Binance USDT perpetuals with enough listing history in groups of 8.
+Each group gets 300 seconds including warmup. The list refreshes after each pass.
+Alerts cover the current group only. To run with Telegram manually:
+
+```bash
+.venv/bin/python -m signaltrading.watch --rotate-futures --duration 0 --telegram --env-file .env
+```
+
 REST warmup 3m/5m/15m/1h, WebSocket nến đã đóng, RSI Wilder14 + EMA context,
 watch không phải tín hiệu vào lệnh. `--duration 0` chạy liên tục. Chưa có Telegram
 ở chế độ mặc định; SQLite lưu checkpoint/cooldown/outbox qua restart.

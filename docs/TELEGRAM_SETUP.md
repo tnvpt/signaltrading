@@ -8,7 +8,12 @@ From checkout root, privately save straight-quoted token and numeric chat ID(s) 
 .venv/bin/python -m signaltrading.notifications --env-file .env --confirm-send-test
 .venv/bin/python -m signaltrading.watch --duration 0 --telegram --env-file .env
 ```
-First command validates only; second explicitly sends TEST; third enables watches.
+The first command validates configuration. The second sends a TEST message.
+The third sends RSI alerts on closed candles for the automatically selected
+Binance USDT perpetual altcoins (up to 8 by default, ranked by absolute 24h
+price change within the configured quote volume range). See the
+[watcher options](../README.md) for
+the volume filters, or use `--symbols` to monitor a fixed list.
 Explicit file overrides stale shell variables for both credentials without executing
 shell content or interpolating variables. Without --env-file, environment behavior
 below is unchanged. No automatic .env loading. Older environment-only statements
@@ -46,7 +51,7 @@ If shell variables do not match `.env`, use
 `.venv/bin/python -m signaltrading.telegram_diagnose --env-file .env`.
 This explicit diagnostic reads only the token assignment (UTF-8 BOM/CRLF and
 straight quotes supported), does not execute the file and overrides process token
-for this diagnostic only. Runtime watch/TEST still require exported variables.
+for this diagnostic. Watch and TEST also accept an explicit `--env-file`.
 No send, webhook deletion or update-offset acknowledgment. Do not run concurrently
 with another polling consumer; getUpdates may conflict. Output excludes token,
 webhook URL and message text. Share only sanitized status if troubleshooting.

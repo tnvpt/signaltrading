@@ -130,6 +130,7 @@ def render_watch(watch):
             + "Không vào lệnh chỉ vì RSI; không xác minh x50/x100.\n"
             f"Nến đóng: {stamp(watch['bar_close_ms'])}\n"
             f"Quan sát: {stamp(watch['decision_ms'])} | Hạn gửi: {stamp(watch['expires_ms'])}\n"
+            f"Mở Binance Futures: https://www.binance.com/en/futures/{watch['symbol']}\n"
             f"ID: {watch['observation_id'][:12]}")
 
 

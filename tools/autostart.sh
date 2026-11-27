@@ -23,7 +23,7 @@ case "${1:-start}" in
     cd -- "$ROOT"
     printf '%s\n' "$(date -Is) Starting SignalTrading watch"
     exec "$ROOT/.venv/bin/python" -u -m signaltrading.watch \
-      --duration 0 --telegram --env-file "$ROOT/.env" --output "$STATE"
+      --rotate-futures --duration 0 --telegram --env-file "$ROOT/.env" --output "$STATE"
     ;;
   check)
     bash -n "$ROOT/tools/autostart.sh"

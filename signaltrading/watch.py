@@ -21,6 +21,10 @@ from .notifications import WatchStore, telegram_config, sender_loop
 
 LOG = logging.getLogger("signaltrading.watch")
 REST_BASE = "https://fapi.binance.com"
+MIN_HISTORY_BARS = 205
+DEFAULT_TOP_ALTCOINS = 8
+DEFAULT_MIN_VOLUME = 1_000_000
+DEFAULT_MAX_VOLUME = 50_000_000
 
 
 def request_json(path, params=None):
@@ -32,14 +36,60 @@ def request_json(path, params=None):
     return payload
 
 
-def validate_instruments(payload, symbols):
+def active_perpetuals(payload):
     if not isinstance(payload, dict) or not isinstance(payload.get("symbols"), list):
         raise ValueError("Malformed exchange metadata")
-    available = {item["symbol"] for item in payload["symbols"]
+    return {item["symbol"]: item for item in payload["symbols"]
                  if item.get("status") == "TRADING" and item.get("contractType") == "PERPETUAL"
                  and item.get("quoteAsset") == "USDT" and item.get("marginAsset") == "USDT"}
-    if not set(symbols) <= available:
+
+
+def validate_instruments(payload, symbols):
+    if not set(symbols) <= active_perpetuals(payload).keys():
         raise ValueError("Unsupported/inactive USDT linear perpetual symbol")
+
+
+def discover_futures(fetch=request_json):
+    contracts = active_perpetuals(fetch("/fapi/v1/exchangeInfo"))
+    oldest = time.time_ns() // 1_000_000 - (MIN_HISTORY_BARS + 1) * INTERVALS["1h"]
+    symbols = tuple(sorted(
+        symbol for symbol, contract in contracts.items()
+        if symbol.isascii() and symbol.isalnum() and symbol.endswith("USDT")
+        and type(contract.get("onboardDate")) is int and 0 < contract["onboardDate"] <= oldest
+    ))
+    if not symbols:
+        raise ValueError("No active USDT perpetuals with sufficient listing history")
+    return symbols
+
+
+def discover_altcoins(limit, min_volume, max_volume, fetch=request_json):
+    contracts = active_perpetuals(fetch("/fapi/v1/exchangeInfo"))
+    tickers = fetch("/fapi/v1/ticker/24hr")
+    if not isinstance(tickers, list):
+        raise ValueError("Malformed futures ticker list")
+    oldest = time.time_ns() // 1_000_000 - (MIN_HISTORY_BARS + 1) * INTERVALS["1h"]
+    scores = {}
+    for ticker in tickers:
+        symbol = ticker["symbol"]
+        contract = contracts.get(symbol)
+        if (not contract or symbol in {"BTCUSDT", "ETHUSDT"}
+                or contract.get("underlyingType") != "COIN"
+                or not symbol.isascii() or not symbol.isalnum() or not symbol.endswith("USDT")):
+            continue
+        onboard = contract.get("onboardDate")
+        if type(onboard) is not int or not 0 < onboard <= oldest:
+            continue
+        try:
+            volume = float(ticker["quoteVolume"])
+            change = abs(float(ticker["priceChangePercent"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+        if 0 < volume and min_volume <= volume <= max_volume and math.isfinite(change):
+            scores[symbol] = change
+    selected = tuple(sorted(scores, key=lambda symbol: (-scores[symbol], symbol))[:limit])
+    if not selected:
+        raise ValueError("No eligible altcoins in the configured 24h quote volume range")
+    return CaptureConfig(selected).symbols
 
 
 def history(symbol, interval, server_ms):
@@ -49,7 +99,7 @@ def history(symbol, interval, server_ms):
         raise ValueError("Expected historical candle list")
     candles = [rest_candle(symbol, interval, row) for row in rows]
     candles = [bar for bar in candles if bar.close_ms <= server_ms]
-    if len(candles) < 205:
+    if len(candles) < MIN_HISTORY_BARS:
         raise ValueError("Insufficient history for stable warmup contract")
     return candles
 
@@ -70,7 +120,7 @@ class WatchStats:
     last_error: str | None = None
 
 
-async def warmup(symbols, engine, writer, fetch=request_json, load=history):
+async def warmup(symbols, engine, writer, fetch=request_json, load=history, *, skip_unready=False):
     validate_instruments(await asyncio.to_thread(fetch, "/fapi/v1/exchangeInfo"), symbols)
     sent = time.time_ns() // 1_000_000
     payload = await asyncio.to_thread(fetch, "/fapi/v1/time")
@@ -80,28 +130,41 @@ async def warmup(symbols, engine, writer, fetch=request_json, load=history):
         raise ValueError("Local/server clock uncertainty exceeds 1000ms MVP bound")
     # Keep exact checkpoint indicators if REST can bridge from their last close.
     # Context first, no alert from any historical bar.
+    warmed = set()
     for symbol in symbols:
-        for interval in ("15m", "1h", "3m", "5m"):
-            bars = await asyncio.to_thread(load, symbol, interval, server_ms)
-            previous = engine.series.get((symbol, interval))
-            if previous and previous.last:
-                matches = [bar for bar in bars if bar.open_ms == previous.last.open_ms]
-                if not matches or matches[0] != previous.last:
-                    engine.series.pop((symbol, interval), None)
-            for bar in bars:
-                writer.submit("kline_history", bar.record(), received)
-                engine.consume(bar, server_ms, historical=True)
-            expected_end = server_ms // INTERVALS[interval] * INTERVALS[interval]
-            if not bars or bars[-1].close_ms != expected_end:
-                raise CandleGap("Historical tail does not reach last completed interval")
-    writer.submit("watch_status", {"state": "WARMED", "server_ms": server_ms}, received)
+        try:
+            for interval in ("15m", "1h", "3m", "5m"):
+                bars = await asyncio.to_thread(load, symbol, interval, server_ms)
+                previous = engine.series.get((symbol, interval))
+                if previous and previous.last:
+                    matches = [bar for bar in bars if bar.open_ms == previous.last.open_ms]
+                    if not matches or matches[0] != previous.last:
+                        engine.series.pop((symbol, interval), None)
+                for bar in bars:
+                    writer.submit("kline_history", bar.record(), received)
+                    engine.consume(bar, server_ms, historical=True)
+                expected_end = server_ms // INTERVALS[interval] * INTERVALS[interval]
+                if not bars or bars[-1].close_ms != expected_end:
+                    raise CandleGap("Historical tail does not reach last completed interval")
+        except (CandleGap, ValueError) as exc:
+            if not skip_unready:
+                raise
+            for interval in INTERVALS:
+                engine.series.pop((symbol, interval), None)
+            LOG.warning("Skipping %s in this rotation: %s", symbol, exc)
+        else:
+            warmed.add(symbol)
+    if not warmed:
+        raise CandleGap("No symbol in this group completed warmup")
+    writer.submit("watch_status", {"state": "WARMED", "server_ms": server_ms, "symbols": sorted(warmed)}, received)
+    return warmed
 
 
 async def monitor_connection(socket, symbols, engine, writer, stats, *,
                              fetch=request_json, load=history, on_watch=None,
-                             stream_timeout=10.0, store=None, chats=()):
+                             stream_timeout=10.0, store=None, chats=(), skip_unready=False):
     # Start receiving before REST work. Queue saturation aborts rather than lose bars.
-    queue = asyncio.Queue(maxsize=2048)
+    queue = asyncio.Queue(maxsize=max(2048, 1024 * len(symbols)))
     required = {(symbol, interval) for symbol in symbols for interval in INTERVALS}
     last_seen = {}
     started = time.monotonic()
@@ -117,14 +180,15 @@ async def monitor_connection(socket, symbols, engine, writer, stats, *,
 
     receiving = asyncio.create_task(receiver())
     try:
-        boot = asyncio.create_task(warmup(symbols, engine, writer, fetch, load))
+        boot = asyncio.create_task(warmup(symbols, engine, writer, fetch, load, skip_unready=skip_unready))
         try:
             done, _ = await asyncio.wait((boot, receiving, writer.task), return_when=asyncio.FIRST_COMPLETED)
             if writer.task in done:
                 writer.task.result()
             if receiving in done:
                 receiving.result()
-            await boot
+            warmed = await boot
+            required = {key for key in required if key[0] in warmed}
         finally:
             if not boot.done():
                 boot.cancel()
@@ -150,6 +214,8 @@ async def monitor_connection(socket, symbols, engine, writer, stats, *,
             bar, event_ms = stream_candle(payload)
             data = payload.get("data", payload)
             key = (data["s"], data["k"]["i"])
+            if key[0] in symbols and key[0] not in warmed:
+                continue
             if key not in required:
                 raise CandleGap("Unexpected candle stream")
             # Buffered old updates may aid continuity, but cannot create delayed watch alerts.
@@ -185,8 +251,16 @@ async def monitor_connection(socket, symbols, engine, writer, stats, *,
         await asyncio.gather(receiving, return_exceptions=True)
 
 
-async def run_watch(symbols, output, duration=60, *, on_watch=None, telegram=False, env_file=None):
-    CaptureConfig(tuple(symbols))  # Reuse strict USDT symbol validation.
+async def run_watch(symbols, output, duration=60, *, on_watch=None, telegram=False, env_file=None,
+                    top_altcoins=DEFAULT_TOP_ALTCOINS, min_volume=DEFAULT_MIN_VOLUME,
+                    max_volume=DEFAULT_MAX_VOLUME, rotation_seconds=None):
+    if rotation_seconds is not None and (
+            symbols is not None or not math.isfinite(rotation_seconds) or rotation_seconds <= 0):
+        raise ValueError("Futures rotation requires automatic selection and a positive interval")
+    if symbols is not None:
+        symbols = CaptureConfig(tuple(symbols)).symbols
+    if not 1 <= top_altcoins <= 20 or not 0 <= min_volume < max_volume or not math.isfinite(max_volume):
+        raise ValueError("Expected 1–20 altcoins and finite ordered 24h quote volume bounds")
     if not math.isfinite(duration) or duration < 0:
         raise ValueError("Duration must be finite and non-negative")
     stats = WatchStats()
@@ -197,21 +271,53 @@ async def run_watch(symbols, output, duration=60, *, on_watch=None, telegram=Fal
     sending = asyncio.create_task(sender_loop(store, token, chats, lambda: stats.healthy)) if telegram else None
     async with AsyncRecorder(output) as writer:
         writer.submit("watch_session", {"profile": "rsi-watch-1", "symbols": symbols,
+                                        "rotation_seconds": rotation_seconds,
                                         "intervals": list(INTERVALS), "orders_enabled": False},
                       time.time_ns() // 1_000_000)
         try:
             async with asyncio.timeout(duration if duration else None):
                 attempts = 0
+                universe = ()
+                cursor = 0
                 while True:
                     if sending and sending.done():
                         sending.result()
                     try:
-                        async with connect(build_kline_url(symbols), open_timeout=15, close_timeout=2,
+                        selected = symbols
+                        if rotation_seconds is not None:
+                            if cursor >= len(universe):
+                                universe = await asyncio.to_thread(discover_futures)
+                                cursor = 0
+                            selected = universe[cursor:cursor + top_altcoins]
+                            cursor += len(selected)
+                            writer.submit("watch_universe", {"symbols": selected, "processed": cursor,
+                                          "total": len(universe)}, time.time_ns() // 1_000_000)
+                            LOG.info("Futures rotation %s/%s: %s", cursor, len(universe), ", ".join(selected))
+                        elif selected is None:
+                            selected = await asyncio.to_thread(discover_altcoins, top_altcoins, min_volume, max_volume)
+                            writer.submit("watch_universe", {"symbols": selected, "top_altcoins": top_altcoins,
+                                          "min_volume": min_volume, "max_volume": max_volume},
+                                          time.time_ns() // 1_000_000)
+                            LOG.info("Futures altcoins: %s", ", ".join(selected))
+                        async with connect(build_kline_url(selected), open_timeout=15, close_timeout=2,
                                            ping_interval=None, max_queue=32) as socket:
                             stats.connections += 1
                             stats.healthy = False
-                            await monitor_connection(socket, symbols, engine, writer, stats, on_watch=on_watch,
-                                                     store=store, chats=chats)
+                            # Thin markets may go longer between kline updates.
+                            rotation = asyncio.timeout(rotation_seconds)
+                            try:
+                                async with rotation:
+                                    await monitor_connection(
+                                        socket, selected, engine, writer, stats, on_watch=on_watch,
+                                        stream_timeout=45.0 if symbols is None else 10.0,
+                                        store=store, chats=chats, skip_unready=rotation_seconds is not None,
+                                    )
+                            except TimeoutError:
+                                if not rotation.expired():
+                                    raise
+                        attempts = 0
+                        if rotation_seconds is not None:
+                            engine.reset_series()
                     except (OSError, TimeoutError, ConnectionClosed, InvalidHandshake,
                             ValueError, KeyError, TypeError) as exc:
                         stats.recoveries += 1
@@ -237,7 +343,18 @@ async def run_watch(symbols, output, duration=60, *, on_watch=None, telegram=Fal
 
 def main():
     parser = argparse.ArgumentParser(description="Closed-candle RSI watch; no orders")
-    parser.add_argument("--symbols", nargs="+", default=["BTCUSDT", "ETHUSDT"])
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--symbols", nargs="+", help="Follow a fixed list of USDT perpetuals")
+    selection.add_argument("--top-altcoins", type=int, choices=range(1, 21), metavar="1–20",
+                           default=DEFAULT_TOP_ALTCOINS, help="Rank by absolute 24h change (default: 8)")
+    selection.add_argument("--rotate-futures", action="store_true",
+                           help="Cycle through active USDT perpetuals in groups of 8")
+    parser.add_argument("--rotation-seconds", type=float, default=300,
+                        help="Seconds per Futures group, including warmup (default: 300)")
+    parser.add_argument("--min-quote-volume", type=float, default=DEFAULT_MIN_VOLUME,
+                        help="Minimum 24h volume in USDT for automatic selection (default: 1000000)")
+    parser.add_argument("--max-quote-volume", type=float, default=DEFAULT_MAX_VOLUME,
+                        help="Maximum 24h volume in USDT for automatic selection (default: 50000000)")
     parser.add_argument("--duration", type=float, default=60)
     parser.add_argument("--output", type=Path, default=Path("data/candle-watch"))
     parser.add_argument("--telegram", action="store_true", help="Explicitly enable sends to env allowlist")
@@ -245,9 +362,14 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.duration) or args.duration < 0:
         parser.error("Duration must be finite and non-negative")
-    symbols = tuple(sorted(set(s.upper() for s in args.symbols)))
+    if not 0 <= args.min_quote_volume < args.max_quote_volume or not math.isfinite(args.max_quote_volume):
+        parser.error("Expected finite ordered 24h quote volume bounds")
+    if not math.isfinite(args.rotation_seconds) or args.rotation_seconds <= 0:
+        parser.error("Rotation interval must be finite and positive")
+    symbols = tuple(sorted(set(s.upper() for s in args.symbols))) if args.symbols else None
     try:
-        CaptureConfig(symbols)
+        if symbols is not None:
+            CaptureConfig(symbols)
         if args.telegram:
             telegram_config(env_file=args.env_file)
     except ValueError as exc:
@@ -256,7 +378,9 @@ def main():
     try:
         stats = asyncio.run(run_watch(symbols, args.output, args.duration,
                             on_watch=lambda item: print(json.dumps(item, ensure_ascii=False), flush=True),
-                            telegram=args.telegram, env_file=args.env_file))
+                            telegram=args.telegram, env_file=args.env_file, top_altcoins=args.top_altcoins,
+                            min_volume=args.min_quote_volume, max_volume=args.max_quote_volume,
+                            rotation_seconds=args.rotation_seconds if args.rotate_futures else None))
         LOG.info("Watch summary: %s", json.dumps(asdict(stats)))
         return 0 if stats.healthy else 2
     except KeyboardInterrupt:

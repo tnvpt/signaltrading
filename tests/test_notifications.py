@@ -41,6 +41,9 @@ class NotificationTests(unittest.TestCase):
         text = render_watch(observation())
         self.assertIn("CHƯA xác nhận", text)
         self.assertIn("Ngược xu hướng", text)
+        self.assertIn("https://www.binance.com/en/futures/BTCUSDT", text)
+        altcoin = render_watch(dict(observation(), symbol="1000PEPEUSDT"))
+        self.assertIn("https://www.binance.com/en/futures/1000PEPEUSDT", altcoin)
         self.assertLess(len(text), 1000)
         with self.assertRaises(ValueError):
             telegram_config({})
